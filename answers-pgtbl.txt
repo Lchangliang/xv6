@@ -1,0 +1,3 @@
+page 0 contain elf message
+page 2 is stack
+page 1 is gurad page, can't read/write

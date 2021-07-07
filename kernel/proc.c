@@ -6,6 +6,8 @@
 #include "proc.h"
 #include "defs.h"
 
+extern char etext[];
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -34,12 +36,12 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -107,6 +109,19 @@ allocproc(void)
 found:
   p->pid = allocpid();
 
+  // Allocate a kernel page
+  prockvminit(&p->kernel_pagetable);
+
+  // Allocate a page for the process kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  prockvmmap(p->kernel_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     release(&p->lock);
@@ -139,8 +154,19 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if (p->kstack)
+  {
+    pte_t* pte = walk(p->kernel_pagetable, p->kstack, 0);
+    if (pte == 0)
+      panic("freeproc: kstack");
+    kfree((void*)PTE2PA(*pte));
+  }
+  p->kstack = 0;
+  if(p->kernel_pagetable)
+    freewalkkernelpgt(p->kernel_pagetable);
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  p->kernel_pagetable = 0;
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -220,7 +246,7 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
-
+  uvm_map_kvm(p->pagetable, p->kernel_pagetable, 0, p->sz);
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -238,14 +264,18 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint sz, oldsz;
   struct proc *p = myproc();
 
-  sz = p->sz;
+  oldsz = sz = p->sz;
   if(n > 0){
+    // 不能覆盖PLIC地址空间
+    if (PGROUNDUP(oldsz + n) >= PLIC)
+      return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    uvm_map_kvm(p->pagetable, p->kernel_pagetable, oldsz, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -274,7 +304,7 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
+  uvm_map_kvm(np->pagetable, np->kernel_pagetable, 0, np->sz);
   np->parent = p;
 
   // copy saved user registers.
@@ -473,6 +503,7 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        prockvminithart(p->kernel_pagetable);
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -487,6 +518,7 @@ scheduler(void)
     if(found == 0) {
       intr_on();
       asm volatile("wfi");
+      kvminithart();
     }
 #else
     ;
