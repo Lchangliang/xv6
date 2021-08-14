@@ -14,28 +14,61 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
-struct run {
+struct run
+{
   struct run *next;
 };
 
-struct {
+struct
+{
   struct spinlock lock;
   struct run *freelist;
 } kmem;
 
-void
-kinit()
+struct
 {
-  initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  struct spinlock lock;
+  uint count[PGROUNDUP(PHYSTOP) / PGSIZE];
+} ref_count;
+
+void rinit()
+{
+  initlock(&ref_count.lock, "ref_count");
+  int size = PGROUNDUP(PHYSTOP) / PGSIZE;
+  for (int i = 0; i < size; i++)
+  {
+    ref_count.count[i] = 1;
+  }
 }
 
-void
-freerange(void *pa_start, void *pa_end)
+void incr_ref(uint64 pa)
+{
+  acquire(&ref_count.lock);
+  ref_count.count[PGROUNDDOWN(pa) / PGSIZE]++;
+  release(&ref_count.lock);
+}
+
+uint get_and_decr_ref(uint64 pa)
+{
+  uint count;
+  acquire(&ref_count.lock);
+  count = ref_count.count[PGROUNDDOWN(pa) / PGSIZE]--;
+  release(&ref_count.lock);
+  return count;
+}
+
+void kinit()
+{
+  rinit();
+  initlock(&kmem.lock, "kmem");
+  freerange(end, (void *)PHYSTOP);
+}
+
+void freerange(void *pa_start, void *pa_end)
 {
   char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  p = (char *)PGROUNDUP((uint64)pa_start);
+  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
     kfree(p);
 }
 
@@ -43,18 +76,19 @@ freerange(void *pa_start, void *pa_end)
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
-void
-kfree(void *pa)
+void kfree(void *pa)
 {
   struct run *r;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+  if (get_and_decr_ref((uint64)pa) > 1)
+    return;
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
-  r = (struct run*)pa;
+  r = (struct run *)pa;
 
   acquire(&kmem.lock);
   r->next = kmem.freelist;
@@ -72,11 +106,14 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if (r)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+  if (r)
+  {
+    incr_ref((uint64)r);
+    memset((char *)r, 5, PGSIZE); // fill with junk
+  }
+  return (void *)r;
 }

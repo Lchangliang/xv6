@@ -305,32 +305,34 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
-int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
-
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+  for (i = 0; i < sz; i += PGSIZE)
+  {
+    if ((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
+    if ((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
+    if (*pte & PTE_W)
+    {
+      *pte &= ~PTE_W;
+      // 记录COW共享物理页
+      *pte |= PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    pa = PTE2PA(*pte);
+    incr_ref(pa);
+    if (mappages(new, i, PGSIZE, pa, flags) != 0)
+    {
       goto err;
     }
   }
   return 0;
 
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
@@ -358,6 +360,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if (cow_copy(pagetable, va0) != 0)
+      return -1;
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -439,4 +443,41 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+int cow_copy(pagetable_t pagetable, uint64 va)
+{
+  if (va >= MAXVA) return -1;
+  pte_t *pte;
+  if ((pte = walk(pagetable, va, 0)) == 0)
+    return -1;
+  if ((*pte & PTE_V) == 0)
+    return -1;
+  if (*pte & PTE_COW)
+  {
+    uint64 pa;
+    pa = PTE2PA(*pte);
+    *pte &= ~PTE_COW;
+    *pte |= PTE_W;
+    // error 思路，如果ref为2，一个线程decr完，在memmove之前，另一个线程kfree，则会提前释放pa，然后在memmove的时候就会出错
+    //判断引用计数是否等于1，如果等于1，则不用分配新的页面
+    // if (get_and_decr_ref(pa) == 1)
+    // {
+    //   incr_ref(pa);
+    //   return 0;
+    // }
+    uint flags = PTE_FLAGS(*pte);
+    char *mem;
+    if ((mem = kalloc()) == 0)
+    {
+      exit(-1);
+    }
+    memmove(mem, (const char *)pa, PGSIZE);
+    kfree((void*)pa);
+    *pte = PA2PTE(mem) | flags;
+    return 0;
+  } else if (*pte & PTE_W) {
+    return 0;
+  }
+  return -1;
 }
